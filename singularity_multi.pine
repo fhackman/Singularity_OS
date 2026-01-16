@@ -1,0 +1,431 @@
+//@version=5
+strategy("Singularity Capital OS - Multi-Agent Pro", overlay=true, 
+         default_qty_type=strategy.percent_of_equity, default_qty_value=1,
+         calc_on_every_tick=false, process_orders_on_close=true,
+         max_bars_back=500, pyramiding=0, initial_capital=10000,
+         commission_type=strategy.commission.percent, commission_value=0.05)
+
+// ============================================================================
+// SINGULARITY CAPITAL OS - MULTI-AGENT PROFESSIONAL TRADING SYSTEM
+// Version: 2.0 Pro
+// Author: Singularity Capital
+// Description: Advanced multi-agent trading strategy with dynamic risk 
+//              management, session filters, and Python integration
+// ============================================================================
+
+// ============================================================================
+// INPUTS - CORE SETTINGS
+// ============================================================================
+
+// Agent Selection
+agent_symbol = input.string("XAUUSD", "Agent Symbol", options=["XAUUSD", "BTCUSD", "USOIL", "EURUSD", "NAS100", "SPX500"], group="Core Settings", tooltip="Select the trading instrument agent to activate")
+
+// Risk Management Core
+base_risk_pct = input.float(1.0, "Base Risk %", minval=0.01, maxval=5.0, step=0.01, group="Risk Management", tooltip="Base risk percentage per trade")
+dynamic_risk_multiplier = input.float(0.5, "Dynamic Risk Multiplier", minval=0.0, maxval=2.0, step=0.1, group="Risk Management", tooltip="Multiplier applied to base risk (0 = no trading)")
+max_daily_loss_pct = input.float(3.0, "Max Daily Loss %", minval=0.5, maxval=10.0, step=0.5, group="Risk Management", tooltip="Maximum allowed daily drawdown before stopping trades")
+max_drawdown_pct = input.float(10.0, "Max Drawdown %", minval=1.0, maxval=30.0, step=1.0, group="Risk Management", tooltip="Maximum total drawdown allowed")
+
+// Regime & Edge Filters
+min_edge_lb = input.float(0.0, "Min Edge (LB)", minval=-1.0, maxval=2.0, step=0.1, group="Edge Filters", tooltip="Minimum edge threshold from lookback analysis")
+regime_id = input.int(1, "Regime ID", minval=0, maxval=2, group="Edge Filters", tooltip="0=Low Volatility, 1=Mid, 2=Panic")
+allow_panic_trades = input.bool(false, "Allow Panic Trades", group="Edge Filters", tooltip="Enable trading during panic regime")
+
+// Emergency Controls
+kill_switch_active = input.bool(false, "🛑 Kill Switch Active", group="Emergency Controls", tooltip="Emergency stop - closes all positions immediately")
+pause_new_trades = input.bool(false, "⏸ Pause New Trades", group="Emergency Controls", tooltip="Pause opening new positions (keeps existing)")
+
+// ============================================================================
+// INPUTS - TECHNICAL PARAMETERS
+// ============================================================================
+
+// ATR Settings
+atr_period = input.int(14, "ATR Period", minval=5, maxval=50, step=1, group="Technical Settings", tooltip="Period for Average True Range calculation")
+atr_smoothing = input.string("RMA", "ATR Smoothing", options=["RMA", "SMA", "EMA", "WMA"], group="Technical Settings", tooltip="Smoothing method for ATR")
+
+// EMA Settings
+ema_fast_len = input.int(20, "EMA Fast Length", minval=5, maxval=100, step=1, group="Technical Settings")
+ema_slow_len = input.int(50, "EMA Slow Length", minval=20, maxval=200, step=1, group="Technical Settings")
+
+// Z-Score Settings
+zscore_len = input.int(20, "Z-Score Length", minval=10, maxval=50, step=1, group="Technical Settings")
+zscore_entry_threshold = input.float(1.5, "Z-Score Entry Threshold", minval=1.0, maxval=3.0, step=0.1, group="Technical Settings", tooltip="Z-score level for mean reversion entries")
+
+// Volume Filter
+use_volume_filter = input.bool(true, "Use Volume Filter", group="Filters", tooltip="Require above-average volume for entries")
+volume_mult = input.float(1.2, "Volume Multiplier", minval=0.5, maxval=3.0, step=0.1, group="Filters", tooltip="Required volume relative to average")
+volume_avg_len = input.int(20, "Volume Average Length", minval=10, maxval=50, group="Filters")
+
+// Session Filter
+use_session_filter = input.bool(true, "Use Session Filter", group="Session Settings", tooltip="Only trade during specified sessions")
+london_session = input.bool(true, "London Session (08:00-16:00 GMT)", group="Session Settings")
+ny_session = input.bool(true, "New York Session (13:00-21:00 GMT)", group="Session Settings")
+asia_session = input.bool(false, "Asia Session (00:00-08:00 GMT)", group="Session Settings")
+
+// ============================================================================
+// INPUTS - AGENT-SPECIFIC PARAMETERS
+// ============================================================================
+
+// XAUUSD (Gold) Agent
+xau_stop_atr_mult = input.float(1.5, "XAU Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="XAUUSD Agent")
+xau_tp_rr = input.float(1.8, "XAU TP R:R", minval=1.0, maxval=5.0, step=0.1, group="XAUUSD Agent")
+xau_max_bars = input.int(48, "XAU Max Bars in Trade", minval=10, maxval=200, group="XAUUSD Agent", tooltip="Maximum bars before time-based exit")
+xau_use_trailing = input.bool(true, "XAU Use Trailing Stop", group="XAUUSD Agent")
+xau_trail_atr_mult = input.float(1.0, "XAU Trail ATR Mult", minval=0.5, maxval=3.0, step=0.1, group="XAUUSD Agent")
+
+// BTCUSD Agent
+btc_stop_atr_mult = input.float(2.0, "BTC Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="BTCUSD Agent")
+btc_tp_rr = input.float(2.5, "BTC TP R:R", minval=1.0, maxval=5.0, step=0.1, group="BTCUSD Agent")
+btc_use_trailing = input.bool(true, "BTC Trailing Stop", group="BTCUSD Agent")
+btc_trail_atr_mult = input.float(1.5, "BTC Trail ATR Mult", minval=0.5, maxval=3.0, step=0.1, group="BTCUSD Agent")
+
+// USOIL Agent
+oil_stop_atr_mult = input.float(1.8, "OIL Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="USOIL Agent")
+oil_tp_rr = input.float(2.0, "OIL TP R:R", minval=1.0, maxval=5.0, step=0.1, group="USOIL Agent")
+oil_breakout_len = input.int(20, "OIL Breakout Length", minval=10, maxval=50, group="USOIL Agent")
+
+// EURUSD Agent
+eur_stop_atr_mult = input.float(1.3, "EUR Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="EURUSD Agent")
+eur_tp_rr = input.float(1.5, "EUR TP R:R", minval=1.0, maxval=5.0, step=0.1, group="EURUSD Agent")
+
+// NAS100 Agent
+nas_stop_atr_mult = input.float(2.0, "NAS Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="NAS100 Agent")
+nas_tp_rr = input.float(2.2, "NAS TP R:R", minval=1.0, maxval=5.0, step=0.1, group="NAS100 Agent")
+
+// SPX500 Agent
+spx_stop_atr_mult = input.float(1.5, "SPX Stop ATR Mult", minval=0.5, maxval=5.0, step=0.1, group="SPX500 Agent")
+spx_tp_rr = input.float(1.8, "SPX TP R:R", minval=1.0, maxval=5.0, step=0.1, group="SPX500 Agent")
+
+// ============================================================================
+// TECHNICAL CALCULATIONS
+// ============================================================================
+
+// ATR Calculation with selectable smoothing
+atr_src = ta.tr(true)
+atr_val = switch atr_smoothing
+    "RMA" => ta.rma(atr_src, atr_period)
+    "SMA" => ta.sma(atr_src, atr_period)
+    "EMA" => ta.ema(atr_src, atr_period)
+    "WMA" => ta.wma(atr_src, atr_period)
+    => ta.rma(atr_src, atr_period)
+
+// Exponential Moving Averages
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+trend_up = ema_fast > ema_slow
+trend_down = ema_fast < ema_slow
+trend_strength = math.abs(ema_fast - ema_slow) / atr_val
+
+// Z-Score for Mean Reversion
+sma_z = ta.sma(close, zscore_len)
+stdev_z = ta.stdev(close, zscore_len)
+zscore = stdev_z > 0 ? (close - sma_z) / stdev_z : 0.0
+
+// Mean Reversion Signals
+mean_revert_long = zscore <= -zscore_entry_threshold
+mean_revert_short = zscore >= zscore_entry_threshold
+
+// Breakout Levels (calculated once, used for multiple agents)
+hh20 = ta.highest(high, oil_breakout_len)
+ll20 = ta.lowest(low, oil_breakout_len)
+
+// Volume Filter
+vol_avg = ta.sma(volume, volume_avg_len)
+vol_above_avg = not use_volume_filter or (volume > vol_avg * volume_mult)
+
+// ============================================================================
+// SESSION TIME FILTER
+// ============================================================================
+
+// Get current hour in GMT (approximate - TradingView uses exchange timezone)
+current_hour = hour(time, "GMT")
+
+in_london = current_hour >= 8 and current_hour < 16
+in_ny = current_hour >= 13 and current_hour < 21
+in_asia = current_hour >= 0 and current_hour < 8
+
+session_ok = not use_session_filter or 
+             (london_session and in_london) or 
+             (ny_session and in_ny) or 
+             (asia_session and in_asia)
+
+// ============================================================================
+// DRAWDOWN & EQUITY PROTECTION
+// ============================================================================
+
+var float peak_equity = strategy.initial_capital
+var float daily_start_equity = strategy.initial_capital
+var bool daily_loss_exceeded = false
+
+if dayofweek != dayofweek[1]
+    daily_start_equity := strategy.equity
+    daily_loss_exceeded := false
+
+peak_equity := math.max(peak_equity, strategy.equity)
+
+current_drawdown_pct = peak_equity > 0 ? ((peak_equity - strategy.equity) / peak_equity) * 100 : 0
+daily_loss_current = daily_start_equity > 0 ? ((daily_start_equity - strategy.equity) / daily_start_equity) * 100 : 0
+
+if daily_loss_current >= max_daily_loss_pct
+    daily_loss_exceeded := true
+
+drawdown_ok = current_drawdown_pct < max_drawdown_pct and not daily_loss_exceeded
+
+// ============================================================================
+// RISK & POSITION LOGIC
+// ============================================================================
+
+final_risk_pct = base_risk_pct * dynamic_risk_multiplier
+
+// Agent-specific stop and TP parameters
+stop_atr_mult = switch agent_symbol
+    "XAUUSD" => xau_stop_atr_mult
+    "BTCUSD" => btc_stop_atr_mult
+    "USOIL" => oil_stop_atr_mult
+    "EURUSD" => eur_stop_atr_mult
+    "NAS100" => nas_stop_atr_mult
+    "SPX500" => spx_stop_atr_mult
+    => 1.5
+
+tp_rr = switch agent_symbol
+    "XAUUSD" => xau_tp_rr
+    "BTCUSD" => btc_tp_rr
+    "USOIL" => oil_tp_rr
+    "EURUSD" => eur_tp_rr
+    "NAS100" => nas_tp_rr
+    "SPX500" => spx_tp_rr
+    => 2.0
+
+// Calculate stop and TP distances
+stop_distance = math.max(atr_val * stop_atr_mult, syminfo.mintick * 10)
+tp_distance = stop_distance * tp_rr
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+
+// Base conditions for any trade
+can_trade = not kill_switch_active and not pause_new_trades and (regime_id != 2 or allow_panic_trades) and dynamic_risk_multiplier > 0.01 and session_ok and vol_above_avg and drawdown_ok
+
+// Agent-specific entry logic
+var bool entry_long = false
+var bool entry_short = false
+
+if agent_symbol == "XAUUSD"
+    entry_long := bool(mean_revert_long and can_trade)
+    entry_short := bool(mean_revert_short and can_trade)
+else if agent_symbol == "BTCUSD"
+    entry_long := bool(trend_up and ta.crossover(close, ema_fast) and can_trade)
+    entry_short := bool(trend_down and ta.crossunder(close, ema_fast) and can_trade)
+else if agent_symbol == "USOIL"
+    entry_long := bool(close > hh20[1] and can_trade)
+    entry_short := bool(close < ll20[1] and can_trade)
+else if agent_symbol == "EURUSD"
+    entry_long := bool(mean_revert_long and trend_up and can_trade)
+    entry_short := bool(mean_revert_short and trend_down and can_trade)
+else if agent_symbol == "NAS100"
+    entry_long := bool(trend_up and ta.crossover(close, ema_fast) and vol_above_avg and can_trade)
+    entry_short := bool(trend_down and ta.crossunder(close, ema_fast) and vol_above_avg and can_trade)
+else if agent_symbol == "SPX500"
+    entry_long := bool(trend_up and zscore < 0 and zscore > -1.5 and can_trade)
+    entry_short := bool(trend_down and zscore > 0 and zscore < 1.5 and can_trade)
+else
+    entry_long := false
+    entry_short := false
+
+// ============================================================================
+// EXECUTION
+// ============================================================================
+
+// Time tracking for time-based exits
+var int entry_bar = na
+var float entry_price = na
+
+if strategy.position_size == 0
+    entry_bar := na
+    entry_price := na
+
+// Entry execution (Fixed: removed deprecated 'when' parameter)
+if entry_long and strategy.position_size == 0
+    entry_bar := bar_index
+    entry_price := close
+    strategy.entry("Long", strategy.long)
+    
+if entry_short and strategy.position_size == 0
+    entry_bar := bar_index
+    entry_price := close
+    strategy.entry("Short", strategy.short)
+
+// Exit management for Long positions
+if strategy.position_size > 0
+    long_stop = entry_price - stop_distance
+    long_tp = entry_price + tp_distance
+    
+    // Trailing stop for XAU and BTC
+    use_trail = (agent_symbol == "XAUUSD" and xau_use_trailing) or (agent_symbol == "BTCUSD" and btc_use_trailing)
+    trail_mult = agent_symbol == "XAUUSD" ? xau_trail_atr_mult : btc_trail_atr_mult
+    
+    if use_trail
+        strategy.exit("XL", "Long", stop=long_stop, limit=long_tp, trail_points=atr_val * trail_mult / syminfo.mintick, trail_offset=atr_val * trail_mult * 0.5 / syminfo.mintick)
+    else
+        strategy.exit("XL", "Long", stop=long_stop, limit=long_tp)
+
+// Exit management for Short positions
+if strategy.position_size < 0
+    short_stop = entry_price + stop_distance
+    short_tp = entry_price - tp_distance
+    
+    use_trail = (agent_symbol == "XAUUSD" and xau_use_trailing) or (agent_symbol == "BTCUSD" and btc_use_trailing)
+    trail_mult = agent_symbol == "XAUUSD" ? xau_trail_atr_mult : btc_trail_atr_mult
+    
+    if use_trail
+        strategy.exit("XS", "Short", stop=short_stop, limit=short_tp, trail_points=atr_val * trail_mult / syminfo.mintick, trail_offset=atr_val * trail_mult * 0.5 / syminfo.mintick)
+    else
+        strategy.exit("XS", "Short", stop=short_stop, limit=short_tp)
+
+// Time-based exit for XAU
+if agent_symbol == "XAUUSD" and not na(entry_bar) and strategy.position_size != 0
+    bars_held = bar_index - entry_bar
+    if bars_held >= xau_max_bars
+        strategy.close_all(comment="Time Exit XAU")
+
+// Kill Switch - Emergency Close All
+if kill_switch_active and strategy.position_size != 0
+    strategy.close_all(comment="🛑 Kill Switch")
+
+// Drawdown Protection Close
+if not drawdown_ok and strategy.position_size != 0
+    strategy.close_all(comment="⚠️ Drawdown Limit")
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+
+// EMA Plots with dynamic colors
+ema_fast_color = trend_up ? color.new(color.green, 30) : color.new(color.red, 30)
+ema_slow_color = color.new(color.orange, 40)
+
+plot(ema_fast, "EMA Fast", color=ema_fast_color, linewidth=2)
+plot(ema_slow, "EMA Slow", color=ema_slow_color, linewidth=1)
+
+// Entry signals
+plotshape(entry_long and strategy.position_size == 0, title="Long Signal", location=location.belowbar, color=color.new(color.green, 0), style=shape.triangleup, size=size.small)
+plotshape(entry_short and strategy.position_size == 0, title="Short Signal", location=location.abovebar, color=color.new(color.red, 0), style=shape.triangledown, size=size.small)
+
+// Background for session and regime
+bgcolor_session = session_ok ? color.new(color.blue, 97) : color.new(color.gray, 97)
+bgcolor(use_session_filter ? bgcolor_session : na, title="Session Background")
+
+regime_bg = regime_id == 0 ? color.new(color.green, 95) : regime_id == 1 ? color.new(color.yellow, 95) : color.new(color.red, 90)
+bgcolor(regime_bg, title="Regime Background")
+
+// Kill switch warning
+bgcolor(kill_switch_active ? color.new(color.red, 80) : na, title="Kill Switch Warning")
+
+// Dynamic Stop/TP Lines
+var line stop_line = na
+var line tp_line = na
+var label pos_label = na
+
+if barstate.islast
+    line.delete(stop_line)
+    line.delete(tp_line)
+    label.delete(pos_label)
+    
+    if strategy.position_size > 0 and not na(entry_price)
+        stop_line := line.new(bar_index - 10, entry_price - stop_distance, bar_index + 5, entry_price - stop_distance, color=color.red, width=2, style=line.style_dashed)
+        tp_line := line.new(bar_index - 10, entry_price + tp_distance, bar_index + 5, entry_price + tp_distance, color=color.green, width=2, style=line.style_dashed)
+        pos_label := label.new(bar_index + 3, entry_price, "LONG\nEntry: " + str.tostring(entry_price, "#.##"), color=color.new(color.green, 70), textcolor=color.white, size=size.small)
+    else if strategy.position_size < 0 and not na(entry_price)
+        stop_line := line.new(bar_index - 10, entry_price + stop_distance, bar_index + 5, entry_price + stop_distance, color=color.red, width=2, style=line.style_dashed)
+        tp_line := line.new(bar_index - 10, entry_price - tp_distance, bar_index + 5, entry_price - tp_distance, color=color.green, width=2, style=line.style_dashed)
+        pos_label := label.new(bar_index + 3, entry_price, "SHORT\nEntry: " + str.tostring(entry_price, "#.##"), color=color.new(color.red, 70), textcolor=color.white, size=size.small)
+
+// ============================================================================
+// STATUS TABLE
+// ============================================================================
+
+var table status = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 85), frame_color=color.gray, frame_width=1, border_color=color.gray, border_width=1)
+
+if barstate.islast
+    // Row 0: Agent
+    regime_txt = regime_id == 0 ? "Low Vol" : regime_id == 1 ? "Normal" : "⚠️ Panic"
+    regime_col = regime_id == 0 ? color.green : regime_id == 1 ? color.yellow : color.red
+    
+    pos_txt = strategy.position_size > 0 ? "🔼 LONG" : 
+              strategy.position_size < 0 ? "🔽 SHORT" : "⏹ FLAT"
+    pos_col = strategy.position_size > 0 ? color.green : 
+              strategy.position_size < 0 ? color.red : color.gray
+    
+    table.cell(status, 0, 0, "Agent", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 0, agent_symbol, text_color=color.yellow, text_size=size.small)
+    
+    table.cell(status, 0, 1, "Risk %", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 1, str.tostring(final_risk_pct, "#.##") + "%", text_color=color.white, text_size=size.small)
+    
+    table.cell(status, 0, 2, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 2, regime_txt, text_color=regime_col, text_size=size.small)
+    
+    table.cell(status, 0, 3, "Kill", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 3, kill_switch_active ? "🛑 ON" : "✅ OFF", text_color=kill_switch_active ? color.red : color.green, text_size=size.small)
+    
+    table.cell(status, 0, 4, "Position", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 4, pos_txt, text_color=pos_col, text_size=size.small)
+    
+    table.cell(status, 0, 5, "Session", text_color=color.white, text_size=size.small)
+    session_txt = in_london ? "London" : in_ny ? "New York" : in_asia ? "Asia" : "Off"
+    table.cell(status, 1, 5, session_ok ? session_txt : "Filtered", text_color=session_ok ? color.green : color.gray, text_size=size.small)
+    
+    table.cell(status, 0, 6, "Drawdown", text_color=color.white, text_size=size.small)
+    dd_col = current_drawdown_pct < 5 ? color.green : current_drawdown_pct < 10 ? color.yellow : color.red
+    table.cell(status, 1, 6, str.tostring(current_drawdown_pct, "#.##") + "%", text_color=dd_col, text_size=size.small)
+    
+    table.cell(status, 0, 7, "Daily P&L", text_color=color.white, text_size=size.small)
+    daily_pnl_col = daily_loss_current <= 0 ? color.green : daily_loss_current < 2 ? color.yellow : color.red
+    table.cell(status, 1, 7, (daily_loss_current <= 0 ? "+" : "-") + str.tostring(math.abs(daily_loss_current), "#.##") + "%", text_color=daily_pnl_col, text_size=size.small)
+    
+    // P&L in R
+    pnl_r = 0.0
+    if strategy.position_size != 0 and not na(entry_price) and stop_distance > 0
+        if strategy.position_size > 0
+            pnl_r := (close - entry_price) / stop_distance
+        else
+            pnl_r := (entry_price - close) / stop_distance
+    
+    table.cell(status, 0, 8, "PnL (R)", text_color=color.white, text_size=size.small)
+    if strategy.position_size != 0
+        table.cell(status, 1, 8, str.tostring(pnl_r, "#.##") + "R", text_color=pnl_r >= 0 ? color.green : color.red, text_size=size.small)
+    else
+        table.cell(status, 1, 8, "—", text_color=color.gray, text_size=size.small)
+    
+    // ATR Info
+    table.cell(status, 0, 9, "ATR", text_color=color.white, text_size=size.small)
+    table.cell(status, 1, 9, str.tostring(atr_val, "#.##"), text_color=color.white, text_size=size.small)
+
+// ============================================================================
+// ALERTS FOR PYTHON INTEGRATION
+// ============================================================================
+
+// Entry Alert
+if (entry_long or entry_short) and strategy.position_size[1] == 0 and bar_index > 1
+    direction = entry_long ? "long" : "short"
+    alert_msg = '{"action":"entry","direction":"' + direction + '","symbol":"' + agent_symbol + '","price":' + str.tostring(close) + ',"stop":' + str.tostring(entry_long ? close - stop_distance : close + stop_distance) + ',"tp":' + str.tostring(entry_long ? close + tp_distance : close - tp_distance) + ',"risk":' + str.tostring(final_risk_pct) + ',"regime":' + str.tostring(regime_id) + ',"atr":' + str.tostring(atr_val) + ',"zscore":' + str.tostring(zscore, "#.##") + ',"timestamp":"' + str.tostring(time) + '"}'
+    alert(alert_msg, alert.freq_once_per_bar)
+
+// Exit Alert
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    prev_direction = strategy.position_size[1] > 0 ? "long" : "short"
+    alert_exit = '{"action":"exit","direction":"' + prev_direction + '","symbol":"' + agent_symbol + '","price":' + str.tostring(close) + ',"timestamp":"' + str.tostring(time) + '"}'
+    alert(alert_exit, alert.freq_once_per_bar)
+
+// Kill Switch Alert
+if kill_switch_active and bar_index > 1
+    alert('{"action":"kill_switch","symbol":"' + agent_symbol + '","timestamp":"' + str.tostring(time) + '"}', alert.freq_once_per_bar)
+
+// Drawdown Alert
+if not drawdown_ok and drawdown_ok[1]
+    alert('{"action":"drawdown_exceeded","symbol":"' + agent_symbol + '","drawdown":' + str.tostring(current_drawdown_pct) + ',"timestamp":"' + str.tostring(time) + '"}', alert.freq_once_per_bar)
+
+// Regime Change Alert
+if regime_id != regime_id[1] and bar_index > 1
+    alert('{"action":"regime_change","symbol":"' + agent_symbol + '","from":' + str.tostring(regime_id[1]) + ',"to":' + str.tostring(regime_id) + ',"timestamp":"' + str.tostring(time) + '"}', alert.freq_once_per_bar)
